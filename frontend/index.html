@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>eventSync - High Concurrency Booking</title>
+  <link rel="stylesheet" href="style.css">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  
+  <!-- Notification Toast -->
+  <div id="toast" class="toast hidden"></div>
+
+  <!-- Navigation Bar -->
+  <nav class="navbar">
+    <div class="logo">
+      <span class="logo-icon">🎟️</span> eventSync
+    </div>
+    <div class="nav-links" id="navLinks">
+      <!-- Will be populated by JS based on Auth state -->
+    </div>
+  </nav>
+
+  <!-- Main App Container -->
+  <main class="container">
+
+    <!-- Auth Section (Login / Sign up) -->
+    <section id="authSection" class="glass-panel slide-up">
+      <div class="auth-toggle">
+        <button id="btnShowLogin" class="btn-tab active">Login</button>
+        <button id="btnShowRegister" class="btn-tab">Register</button>
+      </div>
+      
+      <form id="loginForm" class="auth-form">
+        <h2>Welcome Back</h2>
+        <div class="input-group">
+          <input type="email" id="loginEmail" required placeholder=" ">
+          <label>Email Address</label>
+        </div>
+        <div class="input-group">
+          <input type="password" id="loginPassword" required placeholder=" ">
+          <label>Password</label>
+        </div>
+        <button type="submit" class="btn-primary">Sign In</button>
+      </form>
+
+      <form id="registerForm" class="auth-form hidden">
+        <h2>Create Account</h2>
+        <div class="input-group">
+          <input type="text" id="regName" required placeholder=" ">
+          <label>Full Name</label>
+        </div>
+        <div class="input-group">
+          <input type="email" id="regEmail" required placeholder=" ">
+          <label>Email Address</label>
+        </div>
+        <div class="input-group">
+          <input type="text" id="regPhone" required placeholder=" ">
+          <label>Phone Number</label>
+        </div>
+        <div class="input-group">
+          <input type="password" id="regPassword" required placeholder=" ">
+          <label>Password</label>
+        </div>
+        <button type="submit" class="btn-primary">Sign Up</button>
+      </form>
+    </section>
+
+    <!-- Dashboard Section (Events) -->
+    <section id="dashboardSection" class="hidden fade-in">
+      
+      <!-- User Info Header -->
+      <header class="dashboard-header">
+        <h1 id="welcomeMessage">Hello, User!</h1>
+        <p>Book your favorite events before seats run out. Atomic seating guaranteed.</p>
+      </header>
+
+      <!-- Events Grid -->
+      <div class="events-container">
+        <div class="events-header">
+          <h2>Upcoming Events</h2>
+          <button id="btnRefreshEvents" class="btn-secondary">🔄 Refresh</button>
+        </div>
+        
+        <div id="eventsGrid" class="events-grid">
+          <!-- Event Cards injected via JS -->
+          <div class="loading-spinner">Loading events...</div>
+        </div>
+      </div>
+
+      <!-- My Bookings -->
+      <div class="bookings-container glass-panel mt-4">
+        <h2>My Bookings</h2>
+        <div id="bookingsList" class="bookings-list">
+           <!-- Bookings injected here -->
+        </div>
+      </div>
+
+    </section>
+
+  </main>
+
+  <!-- Admin / Test Controls -->
+  <div class="fab-container hidden" id="adminFabContainer">
+    <button class="btn-fab" id="btnAdminPanel">⚡</button>
+  </div>
+
+  <div class="admin-modal hidden" id="adminModal">
+    <div class="admin-modal-content slide-up">
+      <div class="admin-header">
+        <h2>⚡ Live Architecture Testing</h2>
+        <button class="btn-secondary" id="btnCloseAdmin" style="border:none; font-size:1.5rem">×</button>
+      </div>
+      <div class="admin-body">
+        <div class="admin-actions">
+          <button class="btn-secondary" id="btnReseed">🔄 Clear & Reseed DB</button>
+          <button class="btn-primary" id="btnRunTest">🔥 Run Concurrency Test</button>
+        </div>
+        <p style="font-size:0.85rem; color:#666">
+          The test will fire 50 simultaneous booking requests at once against the system to prove Redis prevents race conditions!
+        </p>
+        <div class="log-window" id="testLogWindow">
+> Ready to run tests...
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
