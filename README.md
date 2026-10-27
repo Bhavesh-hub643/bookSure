@@ -1,121 +1,145 @@
-# eventSync Architecture & System Analysis
+# bookSure
 
-_A Hybrid High-Concurrency Event Registration Platform_
+A high-throughput seat reservation backend that prevents overselling when many users try to book the same limited inventory at once.
 
-## 1. Motivation & Problem Statement
+**Stack:** Node.js, Express, PostgreSQL, Redis, Lua, JWT
 
-Modern event ticketing systems operate smoothly until highly anticipated events ("drop events") go live. This creates a **Thundering Herd Problem**: thousands of users attempt to purchase a strictly limited inventory within milliseconds.
+---
 
-Traditional monolith systems relying entirely on Relational Databases (like standard PostgreSQL or MySQL) fail during these traffic spikes due to:
+## The problem
 
-- **Race Conditions:** Two users read that `1` seat is available simultaneously, and both are allowed to book it, causing severe **overselling**.
-- **Database Thrashing:** High simultaneous read/write locks on the same SQL row cause the database to block, spike in latency, and eventually crash.
-- **Heavy Read Strain:** Thousands of users rapidly hitting refresh to check ticket availability unnecessarily cripples backend relational engines.
+When a popular event goes on sale, thousands of requests hit the same few seats within milliseconds. A naive implementation reads the seat count from the database, checks it, then writes the new count. Under concurrency, two requests can both read "1 seat left" and both succeed, so the event is oversold. Heavy read traffic (people refreshing the availability page) adds extra load on the database.
 
-## 2. Core Objective
+bookSure addresses both problems:
 
-**eventSync** solves these bottlenecks by implementing a highly scalable **Hybrid Database Architecture**. It offloads volatile, high-velocity transactions to an in-memory datastore while preserving critical user ledgers in a relational schema.
+- **Race conditions:** seat reservation is a single atomic operation, so two requests can never claim the same seat.
+- **Read pressure:** event data is served from a Redis cache instead of hitting PostgreSQL on every request.
 
-## 3. The Solution Architecture
+## Architecture
 
-The system decouples the "booking" logic from the "ledger" logic by pairing **PostgreSQL** with **Redis**.
-
-### A. PostgreSQL (The Ledger)
-
-Acts as the **immutable source of truth**. It strictly handles persistent, relational, and business-critical data where ACID compliance is non-negotiable:
-
-- User Identity & Authentication (JWTs)
-- Event Metadata & Organizers
-- Financial Payments Ledger
-- Final Booking Confirmations
-
-### B. Redis (The Accelerator & Enforcer)
-
-Acts as the **volatile memory layer** directly handling the brunt of the high-concurrency traffic:
-
-- **Cache-Aside Reads:** Heavy read operations (like loading the event dashboard) bypass Postgres entirely and fetch cached JSON directly from Redis, dropping latency from hundreds of milliseconds to `< 2ms`.
-- **Concurrency Control Engine:** Handles the volatile seat inventory counts.
-
-## 4. How It Solves Race Conditions (The "Secret Sauce")
-
-To guarantee absolute zero overselling, eventSync leverages **Single-Threaded Atomic Lua Scripting** in Redis.
-
-**The Workflow:**
-
-1. A user attempts to book a ticket.
-2. The Node.js API hits Redis with a raw Lua script.
-3. Because Redis operates uniformly on a single thread, it securely queues the 50,000 incoming requests and processes them one-by-one in microseconds.
-4. Intimately within Redis memory, the script performs a strict **Check-And-Decrement**: _Is capacity > requested? If yes, decrement. If no, reject._
-5. This is **Atomic**. There is no window of time between checking the seat boundary and mutating it for another user to sneak in.
-6. The user receives a sub-millisecond rejection (`409 Conflict`) if the event is full, **without ever querying or taxing PostgreSQL.**
-7. If Redis approves the transaction, the API then proceeds to safely append the receipt to the PostgreSQL database.
-
-## 5. Resilient Engineering (Graceful Degradation)
-
-eventSync is engineered for High Availability. If the Redis infrastructure catastrophically fails or goes offline, the Node.js backend seamlessly catches the failure state and dynamically degrades into **DB-Only Mode**.
-
-- The system continues to operate by redirecting capacity checks through PostgreSQL aggregations.
-- The business remains online, prioritizing survival over pure speed until Redis is restored.
-
-## 6. Real-time Architecture Visualizer
-
-To strictly prove the backend logic, eventSync includes a dedicated frontend dashboard injected with Server-Sent Events (SSE).
-
-- It allows stakeholders to manually **Reseed the Database**, flushing memory layers clean.
-- It triggers deliberate **Concurrency Stress Tests**—firing synchronous booking arrays simultaneously and directly capturing and visualizing the backend's exact instantaneous queue and Atomic Rejection rate on the frontend.
-
-## 7. Authentication
-
-eventSync uses JWT bearer tokens.
-
-1. Register a user with `POST /users/register`.
-2. Log in with `POST /users/login` to receive a token.
-3. Send the token on protected requests as `Authorization: Bearer <token>`.
-
-Protected routes include:
-
-- `GET /users/:id`
-- `GET /users/:id/bookings`
-- `GET /bookings/:id`
-- `POST /bookings`
-- `POST /payments`
-- `GET /payments/:id`
-
-Auth behavior:
-
-- Users can only read their own profile, bookings, and payments.
-- Booking creation is tied to the authenticated user.
-- Each user has a booking quota via `booking_limit`.
-
-Example login flow:
-
-```bash
-curl -X POST http://localhost:3000/users/login \
-	-H 'Content-Type: application/json' \
-	-d '{"email":"you@example.com","password":"secret123"}'
+```
+            ┌──────────┐
+ Client ──► │ Express  │
+            │   API    │
+            └────┬─────┘
+                 │
+     ┌───────────┼────────────┐
+     ▼                        ▼
+┌──────────┐            ┌────────────┐
+│  Redis   │            │ PostgreSQL │
+│ seat     │            │ users,     │
+│ counts + │            │ events,    │
+│ read     │            │ bookings,  │
+│ cache    │            │ payments   │
+└──────────┘            └────────────┘
 ```
 
-## 8. MCP Seat Tool
+| Component | Responsibility |
+|-----------|----------------|
+| **PostgreSQL** | Source of truth: users, events, bookings, payments. Durable and relational. |
+| **Redis** | Holds live seat counts and caches event reads (cache-aside). |
+| **Lua script** | Checks and decrements the seat count as one atomic step inside Redis. |
+| **JWT** | Authenticates users on protected routes. |
 
-Start the MCP server with:
+## How a booking works
 
-```bash
-npm run mcp
+1. The client sends `POST /bookings` with a valid JWT.
+2. The API runs a Lua script in Redis that checks whether enough seats remain and, if so, decrements the count.
+3. If there aren't enough seats, the API returns **409 Conflict** immediately, without querying PostgreSQL.
+4. If Redis approves the reservation, the API inserts the booking into PostgreSQL.
+5. If the PostgreSQL insert fails, the seats are released back in Redis so the count stays correct.
+
+### Why a Lua script?
+
+Doing `GET` followed by `DECRBY` as two separate commands leaves a gap in which another request can run between them. Redis executes a Lua script as one uninterrupted step, so no other command can run in the middle. This makes the check-and-decrement atomic.
+
+```lua
+-- KEYS[1] = seat count key, ARGV[1] = tickets requested
+local available = tonumber(redis.call('GET', KEYS[1]))
+local requested = tonumber(ARGV[1])
+
+if available == nil then
+  return -1          -- key missing: seat count not loaded
+end
+
+if available >= requested then
+  redis.call('DECRBY', KEYS[1], requested)
+  return 1           -- reserved
+end
+
+return 0             -- not enough seats
 ```
 
-It exposes one basic tool:
+### Caching (cache-aside)
 
-- `get_event_seats_left`
+`GET /events/:id` checks Redis first. On a miss, it reads from PostgreSQL, stores the result in Redis with a TTL, and returns it. Later reads are served from Redis.
 
-Tool input:
+## API
 
-- `eventId`: the event UUID
+| Method | Route | Auth | Description |
+|--------|-------|------|-------------|
+| POST | `/users/register` | No | Create an account |
+| POST | `/users/login` | No | Log in and receive a JWT |
+| GET | `/events` | No | List events |
+| GET | `/events/:id` | No | Get one event (cached) |
+| GET | `/events/:id/availability` | No | Seats remaining |
+| POST | `/bookings` | Yes | Reserve seats |
+| GET | `/bookings/:id` | Yes | Get your booking |
 
-Tool output:
+Send the token as `Authorization: Bearer <token>`.
 
-- event id
-- title
-- capacity
-- available seats
+## Getting started
 
-This tool uses the same seat-availability logic as the HTTP API, so the MCP client and `/events/:id/availability` stay in sync.
+**Prerequisites:** Node.js 18+, Docker
+
+```bash
+# 1. Clone and install
+git clone https://github.com/Bhavesh-hub643/bookSure.git
+cd bookSure
+npm install
+
+# 2. Configure environment
+cp .env.example .env
+
+# 3. Start PostgreSQL and Redis
+docker compose up -d
+
+# 4. Create tables and seed sample events
+npm run migrate
+npm run seed
+
+# 5. Start the server
+npm start
+```
+
+### Run the tests
+
+```bash
+npm test                 # correctness tests
+npm run test:concurrency # fires simultaneous bookings and checks for oversells
+```
+
+## Project structure
+
+```
+.
+├── src/
+│   ├── routes/        # users, events, bookings
+│   ├── middleware/    # JWT auth
+│   ├── lua/           # reserve-seats script
+│   └── db/            # PostgreSQL and Redis clients
+├── tests/             # correctness and concurrency tests
+├── schema.sql
+├── docker-compose.yml
+└── .env.example
+```
+
+## Design decisions and trade-offs
+
+- **Redis for the hot path, PostgreSQL for durability.** Redis handles the contended counter, while PostgreSQL keeps the permanent record of what actually happened.
+- **Seat counts live in Redis.** After a Redis restart the counts must be rebuilt from PostgreSQL (confirmed bookings subtracted from capacity).
+- **Reject early.** Requests for a full event are answered from Redis alone, so a rush on a sold-out event doesn't load the database.
+
+## Future work
+- Redis-down fallback that counts seats in PostgreSQL.
+- Automatic reconcile job to rebuild seat counts after a Redis restart.
