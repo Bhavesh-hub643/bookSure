@@ -1,6 +1,6 @@
 # bookSure
 
-A high-throughput seat reservation backend that prevents overselling when many users try to book the same limited inventory at once.
+A concurrency-safe seat reservation backend that prevents overselling when many users try to book the same limited inventory at once.
 
 **Stack:** Node.js, Express, PostgreSQL, Redis, Lua, JWT
 
@@ -79,6 +79,34 @@ The script lives in `src/services/seatCounter.service.js` (`atomicDecrementSafe`
 - `GET /events` (paginated list) and `GET /categories` use the same pattern, with their own TTLs. Creating an event or category invalidates the related keys.
 - Set `EVENT_CACHE=off` to disable the event-row cache, which is useful for before/after benchmarks.
 
+## Benchmarks
+
+All numbers were measured on a MacBook Air with Node.js, PostgreSQL and Redis on the same machine (Postgres and Redis in Docker), single Node process. They show relative behavior on one laptop, not production capacity.
+
+| Test | Setup | Result |
+|------|-------|--------|
+| Oversell, Redis Lua path | 1,000 concurrent requests, 100 seats, 5 runs | 0 oversold in every run (exactly 100 bookings, 900 rejected with 409) |
+| Oversell, Postgres-only check (Redis stopped) | 200 concurrent requests, 50 seats, 10 runs | oversold in 10 of 10 runs (16 to 150 extra tickets) |
+| `GET /events/:id`, event cache off | `autocannon -c 50 -d 10`, 2 server sessions | median ~12.7k req/s, p99 5 to 6 ms |
+| `GET /events/:id`, event cache on | same, 4 server sessions | ~25k req/s and p99 2 to 4 ms in 3 sessions; ~12k req/s in 1 session |
+
+Notes:
+
+- The oversell test registers one user per request, sends 1 ticket each, and then counts confirmed tickets in PostgreSQL, so it does not trust the HTTP responses.
+- The Postgres-only result uses the app's own fallback path (check booked seats, then insert), which is not atomic.
+- One cache-on session did not reach the higher throughput and the cause was not identified, so treat the cache gain as roughly 2x on this machine, not as a guarantee.
+- Numbers vary between server restarts.
+
+To reproduce:
+
+```bash
+npm run test:oversell -- 1000 100                       # oversell test
+EVENT_CACHE=off npm start                               # then, in another terminal:
+npx autocannon -c 50 -d 10 http://localhost:3000/events/<EVENT_ID>
+```
+
+Repeat the `autocannon` command with a plain `npm start` to measure the cache-on case.
+
 ## API
 
 | Method | Route | Auth | Description |
@@ -121,21 +149,21 @@ cd bookSure
 npm install
 
 # 2. Configure environment
-cp .env.example .env     # then edit DB_PASSWORD and JWT_SECRET
+cp .env.example .env     # then edit DB_NAME, DB_PASSWORD and JWT_SECRET
 
 # 3. Start PostgreSQL and Redis (skip if you already run them)
-docker run -d --name booksure-pg -p 5432:5432 -e POSTGRES_PASSWORD=yourpassword -e POSTGRES_DB=eventscale postgres:16
+docker run -d --name booksure-pg -p 5432:5432 -e POSTGRES_PASSWORD=yourpassword -e POSTGRES_DB=booksure postgres:16
 docker run -d --name booksure-redis -p 6379:6379 redis:7
 
 # 4. Create tables and seed sample events
-npm run migrate
+docker exec -i booksure-pg psql -U postgres -d booksure < schema.sql
 npm run seed
 
 # 5. Start the server
 npm start
 ```
 
-`DB_NAME`, `DB_USER` and `DB_PASSWORD` in `.env` must match the database you created. The `migrate` script assumes the database is named `eventscale` on `localhost` and needs `psql` installed; edit it in `package.json` if yours differs.
+`DB_NAME`, `DB_USER` and `DB_PASSWORD` in `.env` must match the database you created (`booksure` in the commands above). If you have `psql` installed locally you can use a `migrate` script that runs `schema.sql` instead of the `docker exec` line.
 
 The demo UI is a static page: open `frontend/index.html` in a browser while the server runs. Its admin panel (⚡ button) can reseed the database and fire a 50-request concurrency test.
 
@@ -177,5 +205,6 @@ A passing oversell run prints `oversold: 0` and `soldInDb` equal to the event ca
 - **Reject early.** Requests for a sold-out event are answered from Redis alone, so a rush on a sold-out event doesn't load the database.
 - **Reserve first, validate after.** Seats are claimed in Redis before the per-user checks run in PostgreSQL, and are released if those checks or the insert fail.
 - **Seat counters live in Redis.** After a Redis restart the counters are rebuilt lazily from PostgreSQL (capacity minus non-cancelled bookings), using `SET ... NX` so concurrent requests don't overwrite each other.
-- **PostgreSQL fallback when Redis is down.** The app keeps serving bookings using a plain capacity check in PostgreSQL. **This path is not atomic and can oversell under heavy concurrency**, so the "zero oversells" guarantee applies only while Redis is available.
-- **Known gap:** if the process crashes between the Redis decrement and the PostgreSQL insert, the seats stay held in Redis until the counter is rebuilt.
+- **PostgreSQL fallback when Redis is down.** The app keeps serving bookings using a plain capacity check in PostgreSQL. **This path is not atomic and can oversell under heavy concurrency** (see Benchmarks), so the "zero oversells" guarantee applies only while Redis is available.
+- **Known gap: no automatic Redis recovery.** The Redis client stops retrying after a few failed attempts, so after a Redis outage the server must be restarted to use the atomic path again; until then it stays on the fallback.
+- **Known gap: crash between steps.** If the process crashes between the Redis decrement and the PostgreSQL insert, the seats stay held in Redis until the counter is rebuilt.
